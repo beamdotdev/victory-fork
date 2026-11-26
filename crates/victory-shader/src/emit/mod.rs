@@ -114,7 +114,7 @@ pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_DISPATCH_SPREAD, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     set_view_heap_limit, view_heap_limit,
 };
 
@@ -268,6 +268,21 @@ pub struct HostShader {
     pub root_uavs: Vec<u8>,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
+    /// Table descriptors (root parameter, dword offset in the table) whose
+    /// buffer the shader reads or writes sixteen bits a channel
+    /// (`buffer_load_format_d16_*`, `buffer_store_format_d16_*`), in
+    /// order. On the console each channel's 16 bits move as they are
+    /// through a 16-bit float view and through a 16-bit integer one alike
+    /// (the title keeps half floats, and indices beside them, in
+    /// `R16G16B16A16_UINT` and `R16_UINT` buffers). The DXIL moves them as
+    /// unsigned integers, which an unsigned 16-bit view carries unchanged;
+    /// the host shows the shader a 16-bit float or signed buffer view at
+    /// these places as the unsigned format of the same layout.
+    /// shortcut: a view in a normalised 16-bit format, whose values the
+    /// console would convert to halves, is read as its integers; a
+    /// descriptor picked at run time keeps the float path (its slot, and so
+    /// its format, is known only then).
+    pub half_views: Vec<(u8, u32)>,
 }
 
 impl HostShader {
@@ -282,6 +297,21 @@ impl HostShader {
             .unwrap_or(0);
         n.next_multiple_of(4)
     }
+}
+
+/// A dispatch of `(x, y, z)` groups as the host runs it: `(row, asked x, gx,
+/// gy, gz)`. Spread across z when `can_spread`, `x` > 65,535 and `z` == 1
+/// ([`USER_DISPATCH_SPREAD`]); else `row` 0 and the counts as asked (upstream
+/// VIctory pull request #2312's `spread_groups`).
+pub fn spread_groups(x: u32, y: u32, z: u32, can_spread: bool) -> (u32, u32, u32, u32, u32) {
+    if can_spread && x > 65_535 && z == 1 {
+        let rows = x.div_ceil(65_535);
+        if rows <= 65_535 {
+            let row = x.div_ceil(rows);
+            return (row, x, row, y, rows);
+        }
+    }
+    (0, x, x, y, z)
 }
 
 /// One dword of user data and the root parameter that fills it.
@@ -425,6 +455,10 @@ pub fn emit(
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
         let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // `VICTORY_WAVE_WIDE=last`: the same form, but only for programs that every other
+        // form below leaves at 64 lanes (on a 32-lane host those are refused outright), so
+        // the programs the approximate forms already take keep their barrier-free form.
+        let wide_last = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "last");
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -503,6 +537,23 @@ pub fn emit(
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
+                }
+            }
+        }
+        if wide_last {
+            let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+            let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
+            let bases = [
+                deep.as_ref().map(|f| &f.0),
+                forms[1].1.as_ref().map(|f| &f.0),
+                forms[0].1.as_ref().map(|f| &f.0),
+                Some(p),
+            ];
+            if let Some(base) = bases.into_iter().flatten().next() {
+                let again = widen(c, native, base, why);
+                report("wave-wide branches (last)", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
                 }
             }
         }
@@ -703,6 +754,7 @@ fn emit_program(
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
+        half_views: l.half_views,
     };
     Ok((shader, wave_size))
 }
@@ -1080,6 +1132,7 @@ mod tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1092,6 +1145,7 @@ mod tests {
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
+                half_views: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -1378,6 +1432,7 @@ mod tests {
             root_srvs: l.root_srvs,
             root_uavs: l.root_uavs,
             root_indexed_views: Vec::new(),
+            half_views: l.half_views,
         };
         let (root, pso) = host.compute_pipeline(&cs).unwrap();
         // Twelve dwords: the loads below run across the view's end.
@@ -1531,6 +1586,7 @@ mod tests {
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
                 root_indexed_views: Vec::new(),
+                half_views: l.half_views,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
